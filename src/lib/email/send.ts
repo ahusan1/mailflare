@@ -6,6 +6,7 @@ import { buildSnippet } from "@/lib/email/parse";
 import { dispatchWebhooks } from "@/lib/email/webhooks";
 import { upsertContactFromAddress } from "@/lib/contacts/service";
 import { getAuthorizedSenderAddress } from "@/lib/email/sender";
+import { getEmailAddress } from "@/lib/email/address";
 import { createAuditLog } from "@/lib/mailboxes/audit";
 import {
 	storeMessageAttachments,
@@ -30,8 +31,8 @@ type MailflareEnv = CloudflareEnv & {
 };
 
 /**
- * Convert an ArrayBuffer into a base64 string.
- * Brevo accepts base64 encoded attachment content.
+ * Convert ArrayBuffer to base64.
+ * Brevo requires attachment content in base64 format.
  */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
 	const bytes = new Uint8Array(buffer);
@@ -52,7 +53,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 /**
- * Send an email using Brevo Transactional Email API.
+ * Send email through Brevo Transactional Email API.
  */
 async function sendWithBrevo(
 	env: MailflareEnv,
@@ -63,10 +64,16 @@ async function sendWithBrevo(
 		throw new Error("BREVO_API_KEY is not configured");
 	}
 
+	const senderEmail = getEmailAddress(sender);
+
+	if (!senderEmail) {
+		throw new Error("Valid sender email required");
+	}
+
 	const body: Record<string, unknown> = {
 		sender: {
-    email: getEmailAddress(sender),
-},
+			email: senderEmail,
+		},
 		to: [
 			{
 				email: input.to,
@@ -76,10 +83,7 @@ async function sendWithBrevo(
 	};
 
 	/*
-	 * Brevo supports HTML and text content.
-	 *
-	 * We prefer HTML when available.
-	 * Otherwise we send plain text.
+	 * Email content
 	 */
 	if (input.html) {
 		body.htmlContent = input.html;
@@ -90,18 +94,23 @@ async function sendWithBrevo(
 	}
 
 	/*
-	 * Preserve custom headers where possible.
+	 * Mailflare may provide headers.
+	 *
+	 * Do not send an empty headers object.
 	 */
-	if (input.headers) {
+	if (input.headers && Object.keys(input.headers).length > 0) {
 		body.headers = input.headers;
 	}
 
 	/*
 	 * Brevo attachment format:
-	 * {
-	 *   name: "file.pdf",
-	 *   content: "BASE64..."
-	 * }
+	 *
+	 * attachment: [
+	 *   {
+	 *     name: "file.pdf",
+	 *     content: "BASE64_CONTENT"
+	 *   }
+	 * ]
 	 */
 	if (input.attachments && input.attachments.length > 0) {
 		body.attachment = input.attachments.map((attachment) => ({
@@ -156,6 +165,9 @@ async function sendWithBrevo(
 	return result.messageId;
 }
 
+/**
+ * Main Mailflare send function.
+ */
 export async function sendEmail(
 	env: CloudflareEnv,
 	input: SendEmailInput,
@@ -163,7 +175,8 @@ export async function sendEmail(
 	const db = getDb(env);
 
 	/*
-	 * Keep Mailflare's existing sender authorization.
+	 * Verify that the logged-in user is allowed
+	 * to send from the selected mailbox.
 	 */
 	const sender = await getAuthorizedSenderAddress(
 		env,
@@ -175,7 +188,7 @@ export async function sendEmail(
 	validateAttachments(attachments);
 
 	/*
-	 * Save/update the recipient as a contact.
+	 * Save/update recipient contact.
 	 */
 	await upsertContactFromAddress(env, {
 		userId: input.userId,
@@ -191,7 +204,7 @@ export async function sendEmail(
 	);
 
 	/*
-	 * Save outbound message in Mailflare DB.
+	 * Save outbound message.
 	 */
 	await db.insert(messages).values({
 		id: messageId,
@@ -208,7 +221,7 @@ export async function sendEmail(
 	});
 
 	/*
-	 * Save attachment metadata/content in R2.
+	 * Store attachments in R2.
 	 */
 	try {
 		await storeMessageAttachments(
@@ -247,11 +260,10 @@ export async function sendEmail(
 
 	try {
 		/*
-		 * Brevo is now the outbound email provider.
+		 * Send through Brevo.
 		 *
-		 * This avoids Cloudflare Email Routing's
-		 * "destination address is not a verified address"
-		 * restriction for the reply flow.
+		 * We intentionally do NOT fall back to
+		 * Cloudflare Email Service here.
 		 */
 		const providerMessageId = await sendWithBrevo(
 			env as MailflareEnv,
@@ -260,7 +272,7 @@ export async function sendEmail(
 		);
 
 		/*
-		 * Mark message as successfully sent.
+		 * Mark message as sent.
 		 */
 		await db
 			.update(messages)
@@ -271,7 +283,7 @@ export async function sendEmail(
 			.where(eq(messages.id, messageId));
 
 		/*
-		 * Mark outbound job as successfully sent.
+		 * Mark outbound job as sent.
 		 */
 		await db
 			.update(outboundJobs)
@@ -282,7 +294,7 @@ export async function sendEmail(
 			.where(eq(outboundJobs.id, jobId));
 
 		/*
-		 * Notify Mailflare webhooks.
+		 * Notify webhooks.
 		 */
 		await dispatchWebhooks(
 			env,
@@ -296,7 +308,7 @@ export async function sendEmail(
 		);
 
 		/*
-		 * Create audit log.
+		 * Audit log.
 		 */
 		await createAuditLog(env, {
 			actorUserId: input.userId,
@@ -329,7 +341,7 @@ export async function sendEmail(
 			.where(eq(messages.id, messageId));
 
 		/*
-		 * Save error in outbound job.
+		 * Mark outbound job as failed.
 		 */
 		await db
 			.update(outboundJobs)
@@ -362,6 +374,9 @@ export type OutboundQueueMessage =
 		jobId?: string;
 	};
 
+/**
+ * Process outbound queue messages.
+ */
 export async function processOutboundQueue(
 	env: CloudflareEnv,
 	payload: OutboundQueueMessage,

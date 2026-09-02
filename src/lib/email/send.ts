@@ -65,8 +65,8 @@ async function sendWithBrevo(
 
 	const body: Record<string, unknown> = {
 		sender: {
-			email: sender,
-		},
+    email: getEmailAddress(sender),
+},
 		to: [
 			{
 				email: input.to,

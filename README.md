@@ -41,7 +41,7 @@ Getting started takes three steps:
 
 See the [deployment guide](docs/deployment.md) for required permissions, manual deployment, backups, and updates.
 
-## Local development
+## Local development h
 
 ```bash
 cp .dev.vars.example .dev.vars
